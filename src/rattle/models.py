@@ -63,3 +63,4 @@ class OpenAPISpec:
     version: str
     title: str
     endpoints: tuple[EndpointSpec, ...]
+    warnings: tuple[str, ...] = ()

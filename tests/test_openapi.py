@@ -6,11 +6,6 @@ from rattle.exceptions import InvalidOpenAPISpecError
 from rattle.openapi import OpenAPIParser
 
 
-@pytest.fixture
-def parser() -> OpenAPIParser:
-    return OpenAPIParser()
-
-
 def test_parse_json_spec_with_params_and_body(parser: OpenAPIParser) -> None:
     raw = json.dumps(
         {
