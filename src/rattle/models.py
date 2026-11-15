@@ -14,8 +14,8 @@ class SchemaSpec:
     schema_type: str = "any"
     nullable: bool = False
     enum: tuple[object, ...] = ()
-    minimum: float | None = None
-    maximum: float | None = None
+    minimum: int | float | None = None
+    maximum: int | float | None = None
     min_length: int | None = None
     max_length: int | None = None
     pattern: str | None = None
