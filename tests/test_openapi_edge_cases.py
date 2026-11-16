@@ -70,6 +70,11 @@ def _spec_with_body(schema: object, *, schemas: dict[str, object] | None = None)
             id="unsupported-constraint",
         ),
         pytest.param(
+            {"$ref": "#/components/schemas/Name", "maxLength": 3},
+            "maxLength",
+            id="ref-sibling-is-not-discarded",
+        ),
+        pytest.param(
             {"allOf": [{"type": "string"}], "maxLength": 3},
             "maxLength",
             id="composition-sibling-is-not-discarded",
@@ -93,6 +98,71 @@ def test_large_integer_bounds_keep_their_precision(parser: OpenAPIParser) -> Non
     assert body is not None
     assert isinstance(body.schema.minimum, int)
     assert body.schema.minimum == bound
+
+
+def test_recovery_after_a_reference_resolution_error(parser: OpenAPIParser) -> None:
+    reference = {"$ref": "#/components/schemas/Payload"}
+    with pytest.raises(InvalidOpenAPISpecError, match="Не найдена ссылка"):
+        parser.parse(_spec_with_body(reference))
+
+    result = parser.parse(_spec_with_body(reference, schemas={"Payload": {"type": "string"}}))
+    body = result.endpoints[0].request_body
+    assert body is not None
+    assert body.schema.schema_type == "string"
+    assert body.schema.is_recursive is False
+
+
+def test_mutually_recursive_schemas_are_cut_at_the_current_branch(parser: OpenAPIParser) -> None:
+    result = parser.parse(
+        _spec_with_body(
+            {"$ref": "#/components/schemas/A"},
+            schemas={
+                "A": {
+                    "type": "object",
+                    "properties": {"b": {"$ref": "#/components/schemas/B"}},
+                },
+                "B": {
+                    "type": "object",
+                    "properties": {"a": {"$ref": "#/components/schemas/A"}},
+                },
+            },
+        )
+    )
+    body = result.endpoints[0].request_body
+    assert body is not None
+    assert body.schema.properties["b"].properties["a"].is_recursive is True
+
+
+def test_yaml_alias_cycle_is_a_spec_error_not_a_recursion_error(parser: OpenAPIParser) -> None:
+    raw = """
+openapi: "3.0.3"
+paths:
+  /nodes:
+    post:
+      requestBody:
+        content:
+          application/json:
+            schema: &node
+              type: object
+              properties:
+                child: *node
+"""
+    with pytest.raises(InvalidOpenAPISpecError, match="глубин"):
+        parser.parse(raw)
+
+
+def test_reference_expansion_has_a_finite_budget(parser: OpenAPIParser) -> None:
+    schemas: dict[str, object] = {"Level0": {"type": "string"}}
+    for level in range(1, 16):
+        child = {"$ref": f"#/components/schemas/Level{level - 1}"}
+        schemas[f"Level{level}"] = {
+            "type": "object",
+            "properties": {"left": child, "right": child},
+        }
+
+    raw = _spec_with_body({"$ref": "#/components/schemas/Level15"}, schemas=schemas)
+    with pytest.raises(InvalidOpenAPISpecError, match="лимит"):
+        parser.parse(raw)
 
 
 def test_header_override_is_case_insensitive(parser: OpenAPIParser) -> None:

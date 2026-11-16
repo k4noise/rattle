@@ -65,6 +65,8 @@ _SCHEMA_KEYS = _ANNOTATIONS | {
     "allOf",
 }
 _PATH_METADATA = frozenset({"summary", "description", "servers", "parameters"})
+_MAX_DEPTH = 64
+_MAX_SCHEMA_NODES = 10_000
 
 
 class OpenAPIParser:
@@ -94,11 +96,12 @@ class OpenAPIParser:
 
 
 class _DocumentParser:
-    """Контекст одного разбора: документ и предупреждения."""
+    """Контекст одного разбора: корень для $ref, предупреждения и бюджет обхода."""
 
     def __init__(self, root: dict[str, object]) -> None:
         self._root = root
         self._warnings: list[str] = []
+        self._schema_nodes = 0
 
     def parse(self) -> OpenAPISpec:
         version = self._root.get("openapi")
@@ -228,6 +231,11 @@ class _DocumentParser:
     def _schema(
         self, raw: object, active_refs: frozenset[str] = frozenset(), depth: int = 0
     ) -> SchemaSpec:
+        if depth > _MAX_DEPTH:
+            raise InvalidOpenAPISpecError("Превышена допустимая глубина схемы")
+        self._schema_nodes += 1
+        if self._schema_nodes > _MAX_SCHEMA_NODES:
+            raise InvalidOpenAPISpecError("Превышен лимит раскрытия схем")
         node, refs = self._resolve(_mapping(raw, "Описание схемы"), active_refs)
         if node is None:
             return SchemaSpec(is_recursive=True)
@@ -323,9 +331,49 @@ class _DocumentParser:
     def _resolve(
         self, node: dict[str, object], active_refs: frozenset[str] = frozenset()
     ) -> tuple[dict[str, object] | None, frozenset[str]]:
-        if "$ref" in node:
-            raise NotImplementedError("Раскрытие локальных $ref пока не реализовано")
-        return node, active_refs
+        """None означает рекурсивное поле; цикл чистых алиасов является ошибкой."""
+        chain: set[str] = set()
+        current = node
+        next_refs = active_refs
+        while "$ref" in current:
+            reference = current["$ref"]
+            if not isinstance(reference, str):
+                raise InvalidOpenAPISpecError("Значение $ref должно быть строкой")
+            siblings = {
+                key
+                for key in current
+                if key != "$ref" and key not in _ANNOTATIONS and not key.startswith("x-")
+            }
+            if siblings:
+                raise InvalidOpenAPISpecError(
+                    f"Не поддерживаются поля рядом с $ref: {', '.join(sorted(siblings))}"
+                )
+            if reference in chain:
+                raise InvalidOpenAPISpecError(f"Циклическая ссылка $ref: {reference}")
+            if reference in active_refs:
+                return None, next_refs
+            chain.add(reference)
+            if len(chain) > _MAX_DEPTH:
+                raise InvalidOpenAPISpecError("Превышен лимит цепочки $ref")
+            next_refs = next_refs | {reference}
+            current = self._pointer(reference)
+        return current, next_refs
+
+    def _pointer(self, reference: str) -> dict[str, object]:
+        if not reference.startswith("#/"):
+            raise InvalidOpenAPISpecError(
+                f"Поддерживаются только локальные ссылки $ref: {reference}"
+            )
+        current: object = self._root
+        for token in reference[2:].split("/"):
+            if re.search(r"~(?![01])", token):
+                raise InvalidOpenAPISpecError(f"Некорректный JSON Pointer: {reference}")
+            key = token.replace("~1", "/").replace("~0", "~")
+            mapping = _mapping(current, f"Узел ссылки {reference}")
+            if key not in mapping:
+                raise InvalidOpenAPISpecError(f"Не найдена ссылка $ref: {reference}")
+            current = mapping[key]
+        return _mapping(current, f"Цель ссылки {reference}")
 
 
 def _mapping(value: object, label: str) -> dict[str, object]:
