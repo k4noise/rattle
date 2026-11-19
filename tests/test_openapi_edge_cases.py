@@ -55,7 +55,7 @@ def _spec_with_body(schema: object, *, schemas: dict[str, object] | None = None)
             id="inverted-length-bounds",
         ),
         pytest.param({"type": "integer", "minimum": True}, "minimum", id="boolean-number"),
-        pytest.param({"type": "number", "minimum": float("nan")}, "minimum", id="nan-bound"),
+        pytest.param({"type": "number", "minimum": float("nan")}, "NaN", id="nan-bound"),
         pytest.param(
             {"type": "integer", "minimum": 10, "maximum": 1},
             "minimum",
