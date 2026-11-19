@@ -1,12 +1,10 @@
 """Разбор поддерживаемого подмножества OpenAPI 3.0/3.1 в модели запросов."""
 
-import json
 import math
 import re
 from dataclasses import replace
 
-import yaml
-
+from rattle._document import load_document
 from rattle.exceptions import InvalidOpenAPISpecError
 from rattle.models import (
     EndpointSpec,
@@ -67,6 +65,7 @@ _SCHEMA_KEYS = _ANNOTATIONS | {
 _PATH_METADATA = frozenset({"summary", "description", "servers", "parameters"})
 _MAX_DEPTH = 64
 _MAX_SCHEMA_NODES = 10_000
+_MAX_ENUM_NODES = 10_000
 
 
 class OpenAPIParser:
@@ -83,14 +82,8 @@ class OpenAPIParser:
             raise InvalidOpenAPISpecError("Пустая OpenAPI-схема")
 
         try:
-            document: object
-            try:
-                document = json.loads(text)
-            except json.JSONDecodeError:
-                document = yaml.safe_load(text)
+            document = load_document(text)
             return _DocumentParser(_mapping(document, "Корень OpenAPI-схемы")).parse()
-        except (yaml.YAMLError, ValueError) as error:
-            raise InvalidOpenAPISpecError("Некорректный JSON или YAML в OpenAPI-схеме") from error
         except RecursionError as error:
             raise InvalidOpenAPISpecError("Превышена допустимая глубина документа") from error
 
@@ -102,6 +95,7 @@ class _DocumentParser:
         self._root = root
         self._warnings: list[str] = []
         self._schema_nodes = 0
+        self._enum_nodes = 0
 
     def parse(self) -> OpenAPISpec:
         version = self._root.get("openapi")
@@ -264,7 +258,7 @@ class _DocumentParser:
             raw_enum = node["enum"]
             if not isinstance(raw_enum, list) or not raw_enum:
                 raise InvalidOpenAPISpecError("enum должен быть непустым списком")
-            enum = tuple(raw_enum)
+            enum = tuple(self._enum_value(value) for value in raw_enum)
         raw_required = node.get("required", [])
         if not isinstance(raw_required, list):
             raise InvalidOpenAPISpecError("required должен быть списком имён полей")
@@ -293,6 +287,32 @@ class _DocumentParser:
             properties=properties,
             items=items,
         )
+
+    def _enum_value(
+        self, value: object, active: frozenset[int] = frozenset(), depth: int = 0
+    ) -> object:
+        """Копирует JSON-значение по вхождениям, не сохраняя YAML aliasing."""
+        if depth > _MAX_DEPTH:
+            raise InvalidOpenAPISpecError("Превышена допустимая глубина enum")
+        self._enum_nodes += 1
+        if self._enum_nodes > _MAX_ENUM_NODES:
+            raise InvalidOpenAPISpecError("Превышен лимит раскрытия enum")
+        if value is None or isinstance(value, (str, bool, int)):
+            return value
+        if isinstance(value, float) and math.isfinite(value):
+            return value
+        if isinstance(value, (list, dict)):
+            identity = id(value)
+            if identity in active:
+                raise InvalidOpenAPISpecError("Циклическое значение enum")
+            next_active = active | {identity}
+            if isinstance(value, list):
+                return [self._enum_value(item, next_active, depth + 1) for item in value]
+            return {
+                key: self._enum_value(item, next_active, depth + 1)
+                for key, item in _mapping(value, "Объект enum").items()
+            }
+        raise InvalidOpenAPISpecError("enum должен содержать только JSON-совместимые значения")
 
     def _composition(
         self, node: dict[str, object], refs: frozenset[str], depth: int
