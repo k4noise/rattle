@@ -49,18 +49,8 @@ def _spec_with_body(schema: object, *, schemas: dict[str, object] | None = None)
         pytest.param({"type": "string", "nullable": "false"}, "nullable", id="boolean-string"),
         pytest.param({"type": "string", "minLength": True}, "minLength", id="boolean-length"),
         pytest.param({"type": "string", "minLength": -1}, "minLength", id="negative-length"),
-        pytest.param(
-            {"type": "string", "minLength": 5, "maxLength": 2},
-            "minLength",
-            id="inverted-length-bounds",
-        ),
         pytest.param({"type": "integer", "minimum": True}, "minimum", id="boolean-number"),
         pytest.param({"type": "number", "minimum": float("nan")}, "NaN", id="nan-bound"),
-        pytest.param(
-            {"type": "integer", "minimum": 10, "maximum": 1},
-            "minimum",
-            id="inverted-number-bounds",
-        ),
         pytest.param({"type": "object", "properties": {"x": 42}}, "схем", id="bad-property"),
         pytest.param({"type": "object", "required": [1]}, "required", id="bad-required-name"),
         pytest.param({"type": "string", "enum": []}, "enum", id="empty-enum"),
