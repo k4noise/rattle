@@ -248,11 +248,6 @@ class _DocumentParser:
             for name, value in _mapping(node.get("properties", {}), "Раздел properties").items()
         }
         items = self._schema(node["items"], refs, depth + 1) if "items" in node else None
-        if schema_type == "any":
-            if properties:
-                schema_type = "object"
-            elif items is not None:
-                schema_type = "array"
         enum: tuple[object, ...] = ()
         if "enum" in node:
             raw_enum = node["enum"]
@@ -269,10 +264,6 @@ class _DocumentParser:
             required.add(name)
         minimum, maximum = _number(node, "minimum"), _number(node, "maximum")
         min_length, max_length = _length(node, "minLength"), _length(node, "maxLength")
-        if minimum is not None and maximum is not None and minimum > maximum:
-            raise InvalidOpenAPISpecError("minimum не может быть больше maximum")
-        if min_length is not None and max_length is not None and min_length > max_length:
-            raise InvalidOpenAPISpecError("minLength не может быть больше maxLength")
         return SchemaSpec(
             schema_type=schema_type,
             nullable=nullable or null_type,
