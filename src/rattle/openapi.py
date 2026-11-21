@@ -3,6 +3,7 @@
 import math
 import re
 from dataclasses import replace
+from urllib.parse import unquote
 
 from rattle._document import load_document
 from rattle.exceptions import InvalidOpenAPISpecError
@@ -15,6 +16,8 @@ from rattle.models import (
     RequestBodySpec,
     SchemaSpec,
 )
+
+_Reference = tuple[str, ...]
 
 _METHODS: dict[str, HttpMethod] = {
     "get": "GET",
@@ -202,7 +205,6 @@ class _DocumentParser:
         assert body is not None
         required = _boolean(body, "required")
         content = _mapping(body.get("content"), "Раздел requestBody.content")
-        # Обычный JSON предпочтительнее специфичных application/*+json.
         for exact in (True, False):
             for media_type, value in content.items():
                 base_type = media_type.split(";", 1)[0].strip().lower()
@@ -223,7 +225,7 @@ class _DocumentParser:
         return None
 
     def _schema(
-        self, raw: object, active_refs: frozenset[str] = frozenset(), depth: int = 0
+        self, raw: object, active_refs: frozenset[_Reference] = frozenset(), depth: int = 0
     ) -> SchemaSpec:
         if depth > _MAX_DEPTH:
             raise InvalidOpenAPISpecError("Превышена допустимая глубина схемы")
@@ -306,7 +308,7 @@ class _DocumentParser:
         raise InvalidOpenAPISpecError("enum должен содержать только JSON-совместимые значения")
 
     def _composition(
-        self, node: dict[str, object], refs: frozenset[str], depth: int
+        self, node: dict[str, object], refs: frozenset[_Reference], depth: int
     ) -> SchemaSpec | None:
         keywords = node.keys() & {"anyOf", "allOf"}
         if not keywords:
@@ -340,10 +342,10 @@ class _DocumentParser:
         raise InvalidOpenAPISpecError(f"Неподдерживаемая конструкция {keyword}")
 
     def _resolve(
-        self, node: dict[str, object], active_refs: frozenset[str] = frozenset()
-    ) -> tuple[dict[str, object] | None, frozenset[str]]:
+        self, node: dict[str, object], active_refs: frozenset[_Reference] = frozenset()
+    ) -> tuple[dict[str, object] | None, frozenset[_Reference]]:
         """None означает рекурсивное поле; цикл чистых алиасов является ошибкой."""
-        chain: set[str] = set()
+        chain: set[_Reference] = set()
         current = node
         next_refs = active_refs
         while "$ref" in current:
@@ -359,32 +361,54 @@ class _DocumentParser:
                 raise InvalidOpenAPISpecError(
                     f"Не поддерживаются поля рядом с $ref: {', '.join(sorted(siblings))}"
                 )
-            if reference in chain:
+            tokens = _reference_tokens(reference)
+            if tokens in chain:
                 raise InvalidOpenAPISpecError(f"Циклическая ссылка $ref: {reference}")
-            if reference in active_refs:
+            if tokens in active_refs:
                 return None, next_refs
-            chain.add(reference)
+            chain.add(tokens)
             if len(chain) > _MAX_DEPTH:
                 raise InvalidOpenAPISpecError("Превышен лимит цепочки $ref")
-            next_refs = next_refs | {reference}
-            current = self._pointer(reference)
+            next_refs = next_refs | {tokens}
+            current = self._pointer(tokens, reference)
         return current, next_refs
 
-    def _pointer(self, reference: str) -> dict[str, object]:
-        if not reference.startswith("#/"):
-            raise InvalidOpenAPISpecError(
-                f"Поддерживаются только локальные ссылки $ref: {reference}"
-            )
+    def _pointer(self, tokens: _Reference, reference: str) -> dict[str, object]:
         current: object = self._root
-        for token in reference[2:].split("/"):
-            if re.search(r"~(?![01])", token):
-                raise InvalidOpenAPISpecError(f"Некорректный JSON Pointer: {reference}")
-            key = token.replace("~1", "/").replace("~0", "~")
-            mapping = _mapping(current, f"Узел ссылки {reference}")
-            if key not in mapping:
-                raise InvalidOpenAPISpecError(f"Не найдена ссылка $ref: {reference}")
-            current = mapping[key]
+        for key in tokens:
+            if isinstance(current, list):
+                if re.fullmatch(r"0|[1-9][0-9]*", key) is None:
+                    raise InvalidOpenAPISpecError(f"Некорректный индекс JSON Pointer: {reference}")
+                if len(key) > len(str(len(current))) or int(key) >= len(current):
+                    raise InvalidOpenAPISpecError(f"Не найдена ссылка $ref: {reference}")
+                current = current[int(key)]
+            else:
+                mapping = _mapping(current, f"Узел ссылки {reference}")
+                if key not in mapping:
+                    raise InvalidOpenAPISpecError(f"Не найдена ссылка $ref: {reference}")
+                current = mapping[key]
         return _mapping(current, f"Цель ссылки {reference}")
+
+
+def _reference_tokens(reference: str) -> _Reference:
+    if not reference.startswith("#"):
+        raise InvalidOpenAPISpecError(f"Поддерживаются только локальные ссылки $ref: {reference}")
+    if re.search(r"%(?![0-9a-fA-F]{2})", reference):
+        raise InvalidOpenAPISpecError(f"Некорректный URI в JSON Pointer: {reference}")
+    try:
+        fragment = unquote(reference[1:], errors="strict")
+    except UnicodeDecodeError as error:
+        raise InvalidOpenAPISpecError(f"Некорректный UTF-8 в JSON Pointer: {reference}") from error
+    if fragment == "":
+        return ()
+    if not fragment.startswith("/"):
+        raise InvalidOpenAPISpecError(
+            f"Поддерживается только JSON Pointer во фрагменте: {reference}"
+        )
+    tokens = fragment[1:].split("/")
+    if any(re.search(r"~(?![01])", token) for token in tokens):
+        raise InvalidOpenAPISpecError(f"Некорректный JSON Pointer: {reference}")
+    return tuple(token.replace("~1", "/").replace("~0", "~") for token in tokens)
 
 
 def _mapping(value: object, label: str) -> dict[str, object]:
