@@ -32,6 +32,12 @@ _LOCATIONS: dict[str, ParamLocation] = {
     "header": "header",
     "cookie": "cookie",
 }
+_PARAMETER_STYLES: dict[ParamLocation, str] = {
+    "path": "simple",
+    "query": "form",
+    "header": "simple",
+    "cookie": "form",
+}
 _TYPES = frozenset({"object", "array", "string", "integer", "number", "boolean", "null"})
 _ANNOTATIONS = frozenset(
     {
@@ -115,7 +121,6 @@ class _DocumentParser:
                 raise InvalidOpenAPISpecError(f"Некорректный путь в paths: {path!r}")
             item, _ = self._resolve(_mapping(raw_item, f"Путь {path}"))
             assert item is not None
-            inherited = self._parameters(item.get("parameters"))
             for name, raw_operation in item.items():
                 method = _METHODS.get(name.lower())
                 if method is None:
@@ -124,9 +129,16 @@ class _DocumentParser:
                     elif name not in _PATH_METADATA and not name.startswith("x-"):
                         raise InvalidOpenAPISpecError(f"Неизвестное поле пути {path}: {name}")
                     continue
-                operation = _mapping(raw_operation, f"Операция {method} {path}")
+                operation_label = f"{method} {path}"
+                operation = _mapping(raw_operation, f"Операция {operation_label}")
+                inherited = self._parameters(
+                    item.get("parameters"), f"{operation_label} (уровень пути)"
+                )
                 parameters = self._merge_parameters(
-                    inherited, self._parameters(operation.get("parameters"))
+                    inherited,
+                    self._parameters(
+                        operation.get("parameters"), f"{operation_label} (уровень операции)"
+                    ),
                 )
                 expected = set(re.findall(r"\{([^{}]+)\}", path))
                 actual = {p.name for p in parameters if p.location == "path"}
@@ -137,7 +149,7 @@ class _DocumentParser:
                         method=method,
                         path=path,
                         parameters=parameters,
-                        request_body=self._body(operation.get("requestBody"), f"{method} {path}"),
+                        request_body=self._body(operation.get("requestBody"), operation_label),
                         operation_id=_text(operation, "operationId"),
                     )
                 )
@@ -150,7 +162,7 @@ class _DocumentParser:
             warnings=tuple(self._warnings),
         )
 
-    def _parameters(self, raw: object) -> list[ParameterSpec]:
+    def _parameters(self, raw: object, context: str) -> list[ParameterSpec]:
         if raw is None:
             return []
         if not isinstance(raw, list):
@@ -169,18 +181,25 @@ class _DocumentParser:
                     f"Неподдерживаемое расположение параметра: {location!r}"
                 )
             if location == "header" and name.lower() in {"accept", "content-type", "authorization"}:
-                self._warnings.append(f"Пропущен зарезервированный header-параметр {name}")
+                self._warnings.append(
+                    f"{context}: пропущен зарезервированный header-параметр {name}"
+                )
                 continue
             required = _boolean(parameter, "required", default=location == "path")
             if location == "path" and not required:
                 raise InvalidOpenAPISpecError("У path-параметра required должен быть true")
             if "content" in parameter:
                 raise InvalidOpenAPISpecError("Параметры через content пока не поддерживаются")
+            parsed_location = _LOCATIONS[location]
+            style, explode, allow_reserved = _parameter_serialization(parameter, parsed_location)
             parsed = ParameterSpec(
                 name=name,
-                location=_LOCATIONS[location],
+                location=parsed_location,
                 required=required,
                 schema=self._schema(parameter.get("schema", {}), refs),
+                style=style,
+                explode=explode,
+                allow_reserved=allow_reserved,
             )
             key = _parameter_key(parsed)
             if key in seen:
@@ -469,6 +488,24 @@ def _schema_type(node: dict[str, object]) -> tuple[str, bool]:
         if len(others) == 1 and others[0] in _TYPES:
             return others[0], True
     raise InvalidOpenAPISpecError(f"Неподдерживаемое значение type: {value!r}")
+
+
+def _parameter_serialization(
+    node: dict[str, object], location: ParamLocation
+) -> tuple[str, bool, bool]:
+    default_style = _PARAMETER_STYLES[location]
+    style = _text(node, "style")
+    if style is not None and style != default_style:
+        raise InvalidOpenAPISpecError(
+            f"Неподдерживаемый style для {location}: {style!r}; поддерживается {default_style}"
+        )
+    explode = _boolean(node, "explode", default=default_style == "form")
+    allow_reserved = _boolean(node, "allowReserved")
+    if allow_reserved and location != "query":
+        raise InvalidOpenAPISpecError("allowReserved поддерживается только для query")
+    if _boolean(node, "allowEmptyValue"):
+        raise InvalidOpenAPISpecError("allowEmptyValue=true пока не поддерживается")
+    return default_style, explode, allow_reserved
 
 
 def _parameter_key(parameter: ParameterSpec) -> tuple[str, ParamLocation]:
