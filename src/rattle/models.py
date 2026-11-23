@@ -1,4 +1,8 @@
-"""Модели разобранной OpenAPI-схемы."""
+"""Модели разобранной OpenAPI-схемы.
+
+frozen защищает атрибуты, но не вложенные dict/list. Стандартное равенство
+не является семантическим сравнением JSON Schema; хешируемость не обещается.
+"""
 
 from dataclasses import dataclass, field
 from typing import Literal
@@ -28,12 +32,15 @@ class SchemaSpec:
 
 @dataclass(frozen=True)
 class ParameterSpec:
-    """Описание параметра запроса."""
+    """Параметр запроса; парсер нормализует style/explode по расположению."""
 
     name: str
     location: ParamLocation
     required: bool
     schema: SchemaSpec
+    style: str | None = None
+    explode: bool | None = None
+    allow_reserved: bool = False
 
 
 @dataclass(frozen=True)

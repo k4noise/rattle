@@ -1,12 +1,11 @@
 """Разбор поддерживаемого подмножества OpenAPI 3.0/3.1 в модели запросов."""
 
-import json
 import math
 import re
 from dataclasses import replace
+from urllib.parse import unquote
 
-import yaml
-
+from rattle._document import load_document
 from rattle.exceptions import InvalidOpenAPISpecError
 from rattle.models import (
     EndpointSpec,
@@ -17,6 +16,8 @@ from rattle.models import (
     RequestBodySpec,
     SchemaSpec,
 )
+
+_Reference = tuple[str, ...]
 
 _METHODS: dict[str, HttpMethod] = {
     "get": "GET",
@@ -30,6 +31,12 @@ _LOCATIONS: dict[str, ParamLocation] = {
     "query": "query",
     "header": "header",
     "cookie": "cookie",
+}
+_PARAMETER_STYLES: dict[ParamLocation, str] = {
+    "path": "simple",
+    "query": "form",
+    "header": "simple",
+    "cookie": "form",
 }
 _TYPES = frozenset({"object", "array", "string", "integer", "number", "boolean", "null"})
 _ANNOTATIONS = frozenset(
@@ -67,6 +74,7 @@ _SCHEMA_KEYS = _ANNOTATIONS | {
 _PATH_METADATA = frozenset({"summary", "description", "servers", "parameters"})
 _MAX_DEPTH = 64
 _MAX_SCHEMA_NODES = 10_000
+_MAX_ENUM_NODES = 10_000
 
 
 class OpenAPIParser:
@@ -83,14 +91,8 @@ class OpenAPIParser:
             raise InvalidOpenAPISpecError("Пустая OpenAPI-схема")
 
         try:
-            document: object
-            try:
-                document = json.loads(text)
-            except json.JSONDecodeError:
-                document = yaml.safe_load(text)
+            document = load_document(text)
             return _DocumentParser(_mapping(document, "Корень OpenAPI-схемы")).parse()
-        except (yaml.YAMLError, ValueError) as error:
-            raise InvalidOpenAPISpecError("Некорректный JSON или YAML в OpenAPI-схеме") from error
         except RecursionError as error:
             raise InvalidOpenAPISpecError("Превышена допустимая глубина документа") from error
 
@@ -102,6 +104,7 @@ class _DocumentParser:
         self._root = root
         self._warnings: list[str] = []
         self._schema_nodes = 0
+        self._enum_nodes = 0
 
     def parse(self) -> OpenAPISpec:
         version = self._root.get("openapi")
@@ -118,7 +121,6 @@ class _DocumentParser:
                 raise InvalidOpenAPISpecError(f"Некорректный путь в paths: {path!r}")
             item, _ = self._resolve(_mapping(raw_item, f"Путь {path}"))
             assert item is not None
-            inherited = self._parameters(item.get("parameters"))
             for name, raw_operation in item.items():
                 method = _METHODS.get(name.lower())
                 if method is None:
@@ -127,9 +129,16 @@ class _DocumentParser:
                     elif name not in _PATH_METADATA and not name.startswith("x-"):
                         raise InvalidOpenAPISpecError(f"Неизвестное поле пути {path}: {name}")
                     continue
-                operation = _mapping(raw_operation, f"Операция {method} {path}")
+                operation_label = f"{method} {path}"
+                operation = _mapping(raw_operation, f"Операция {operation_label}")
+                inherited = self._parameters(
+                    item.get("parameters"), f"{operation_label} (уровень пути)"
+                )
                 parameters = self._merge_parameters(
-                    inherited, self._parameters(operation.get("parameters"))
+                    inherited,
+                    self._parameters(
+                        operation.get("parameters"), f"{operation_label} (уровень операции)"
+                    ),
                 )
                 expected = set(re.findall(r"\{([^{}]+)\}", path))
                 actual = {p.name for p in parameters if p.location == "path"}
@@ -140,7 +149,7 @@ class _DocumentParser:
                         method=method,
                         path=path,
                         parameters=parameters,
-                        request_body=self._body(operation.get("requestBody"), f"{method} {path}"),
+                        request_body=self._body(operation.get("requestBody"), operation_label),
                         operation_id=_text(operation, "operationId"),
                     )
                 )
@@ -153,7 +162,7 @@ class _DocumentParser:
             warnings=tuple(self._warnings),
         )
 
-    def _parameters(self, raw: object) -> list[ParameterSpec]:
+    def _parameters(self, raw: object, context: str) -> list[ParameterSpec]:
         if raw is None:
             return []
         if not isinstance(raw, list):
@@ -172,18 +181,25 @@ class _DocumentParser:
                     f"Неподдерживаемое расположение параметра: {location!r}"
                 )
             if location == "header" and name.lower() in {"accept", "content-type", "authorization"}:
-                self._warnings.append(f"Пропущен зарезервированный header-параметр {name}")
+                self._warnings.append(
+                    f"{context}: пропущен зарезервированный header-параметр {name}"
+                )
                 continue
             required = _boolean(parameter, "required", default=location == "path")
             if location == "path" and not required:
                 raise InvalidOpenAPISpecError("У path-параметра required должен быть true")
             if "content" in parameter:
                 raise InvalidOpenAPISpecError("Параметры через content пока не поддерживаются")
+            parsed_location = _LOCATIONS[location]
+            style, explode, allow_reserved = _parameter_serialization(parameter, parsed_location)
             parsed = ParameterSpec(
                 name=name,
-                location=_LOCATIONS[location],
+                location=parsed_location,
                 required=required,
                 schema=self._schema(parameter.get("schema", {}), refs),
+                style=style,
+                explode=explode,
+                allow_reserved=allow_reserved,
             )
             key = _parameter_key(parsed)
             if key in seen:
@@ -208,7 +224,6 @@ class _DocumentParser:
         assert body is not None
         required = _boolean(body, "required")
         content = _mapping(body.get("content"), "Раздел requestBody.content")
-        # Обычный JSON предпочтительнее специфичных application/*+json.
         for exact in (True, False):
             for media_type, value in content.items():
                 base_type = media_type.split(";", 1)[0].strip().lower()
@@ -229,7 +244,7 @@ class _DocumentParser:
         return None
 
     def _schema(
-        self, raw: object, active_refs: frozenset[str] = frozenset(), depth: int = 0
+        self, raw: object, active_refs: frozenset[_Reference] = frozenset(), depth: int = 0
     ) -> SchemaSpec:
         if depth > _MAX_DEPTH:
             raise InvalidOpenAPISpecError("Превышена допустимая глубина схемы")
@@ -254,17 +269,12 @@ class _DocumentParser:
             for name, value in _mapping(node.get("properties", {}), "Раздел properties").items()
         }
         items = self._schema(node["items"], refs, depth + 1) if "items" in node else None
-        if schema_type == "any":
-            if properties:
-                schema_type = "object"
-            elif items is not None:
-                schema_type = "array"
         enum: tuple[object, ...] = ()
         if "enum" in node:
             raw_enum = node["enum"]
             if not isinstance(raw_enum, list) or not raw_enum:
                 raise InvalidOpenAPISpecError("enum должен быть непустым списком")
-            enum = tuple(raw_enum)
+            enum = tuple(self._enum_value(value) for value in raw_enum)
         raw_required = node.get("required", [])
         if not isinstance(raw_required, list):
             raise InvalidOpenAPISpecError("required должен быть списком имён полей")
@@ -275,10 +285,6 @@ class _DocumentParser:
             required.add(name)
         minimum, maximum = _number(node, "minimum"), _number(node, "maximum")
         min_length, max_length = _length(node, "minLength"), _length(node, "maxLength")
-        if minimum is not None and maximum is not None and minimum > maximum:
-            raise InvalidOpenAPISpecError("minimum не может быть больше maximum")
-        if min_length is not None and max_length is not None and min_length > max_length:
-            raise InvalidOpenAPISpecError("minLength не может быть больше maxLength")
         return SchemaSpec(
             schema_type=schema_type,
             nullable=nullable or null_type,
@@ -294,8 +300,34 @@ class _DocumentParser:
             items=items,
         )
 
+    def _enum_value(
+        self, value: object, active: frozenset[int] = frozenset(), depth: int = 0
+    ) -> object:
+        """Копирует JSON-значение по вхождениям, не сохраняя YAML aliasing."""
+        if depth > _MAX_DEPTH:
+            raise InvalidOpenAPISpecError("Превышена допустимая глубина enum")
+        self._enum_nodes += 1
+        if self._enum_nodes > _MAX_ENUM_NODES:
+            raise InvalidOpenAPISpecError("Превышен лимит раскрытия enum")
+        if value is None or isinstance(value, (str, bool, int)):
+            return value
+        if isinstance(value, float) and math.isfinite(value):
+            return value
+        if isinstance(value, (list, dict)):
+            identity = id(value)
+            if identity in active:
+                raise InvalidOpenAPISpecError("Циклическое значение enum")
+            next_active = active | {identity}
+            if isinstance(value, list):
+                return [self._enum_value(item, next_active, depth + 1) for item in value]
+            return {
+                key: self._enum_value(item, next_active, depth + 1)
+                for key, item in _mapping(value, "Объект enum").items()
+            }
+        raise InvalidOpenAPISpecError("enum должен содержать только JSON-совместимые значения")
+
     def _composition(
-        self, node: dict[str, object], refs: frozenset[str], depth: int
+        self, node: dict[str, object], refs: frozenset[_Reference], depth: int
     ) -> SchemaSpec | None:
         keywords = node.keys() & {"anyOf", "allOf"}
         if not keywords:
@@ -329,10 +361,10 @@ class _DocumentParser:
         raise InvalidOpenAPISpecError(f"Неподдерживаемая конструкция {keyword}")
 
     def _resolve(
-        self, node: dict[str, object], active_refs: frozenset[str] = frozenset()
-    ) -> tuple[dict[str, object] | None, frozenset[str]]:
+        self, node: dict[str, object], active_refs: frozenset[_Reference] = frozenset()
+    ) -> tuple[dict[str, object] | None, frozenset[_Reference]]:
         """None означает рекурсивное поле; цикл чистых алиасов является ошибкой."""
-        chain: set[str] = set()
+        chain: set[_Reference] = set()
         current = node
         next_refs = active_refs
         while "$ref" in current:
@@ -348,32 +380,54 @@ class _DocumentParser:
                 raise InvalidOpenAPISpecError(
                     f"Не поддерживаются поля рядом с $ref: {', '.join(sorted(siblings))}"
                 )
-            if reference in chain:
+            tokens = _reference_tokens(reference)
+            if tokens in chain:
                 raise InvalidOpenAPISpecError(f"Циклическая ссылка $ref: {reference}")
-            if reference in active_refs:
+            if tokens in active_refs:
                 return None, next_refs
-            chain.add(reference)
+            chain.add(tokens)
             if len(chain) > _MAX_DEPTH:
                 raise InvalidOpenAPISpecError("Превышен лимит цепочки $ref")
-            next_refs = next_refs | {reference}
-            current = self._pointer(reference)
+            next_refs = next_refs | {tokens}
+            current = self._pointer(tokens, reference)
         return current, next_refs
 
-    def _pointer(self, reference: str) -> dict[str, object]:
-        if not reference.startswith("#/"):
-            raise InvalidOpenAPISpecError(
-                f"Поддерживаются только локальные ссылки $ref: {reference}"
-            )
+    def _pointer(self, tokens: _Reference, reference: str) -> dict[str, object]:
         current: object = self._root
-        for token in reference[2:].split("/"):
-            if re.search(r"~(?![01])", token):
-                raise InvalidOpenAPISpecError(f"Некорректный JSON Pointer: {reference}")
-            key = token.replace("~1", "/").replace("~0", "~")
-            mapping = _mapping(current, f"Узел ссылки {reference}")
-            if key not in mapping:
-                raise InvalidOpenAPISpecError(f"Не найдена ссылка $ref: {reference}")
-            current = mapping[key]
+        for key in tokens:
+            if isinstance(current, list):
+                if re.fullmatch(r"0|[1-9][0-9]*", key) is None:
+                    raise InvalidOpenAPISpecError(f"Некорректный индекс JSON Pointer: {reference}")
+                if len(key) > len(str(len(current))) or int(key) >= len(current):
+                    raise InvalidOpenAPISpecError(f"Не найдена ссылка $ref: {reference}")
+                current = current[int(key)]
+            else:
+                mapping = _mapping(current, f"Узел ссылки {reference}")
+                if key not in mapping:
+                    raise InvalidOpenAPISpecError(f"Не найдена ссылка $ref: {reference}")
+                current = mapping[key]
         return _mapping(current, f"Цель ссылки {reference}")
+
+
+def _reference_tokens(reference: str) -> _Reference:
+    if not reference.startswith("#"):
+        raise InvalidOpenAPISpecError(f"Поддерживаются только локальные ссылки $ref: {reference}")
+    if re.search(r"%(?![0-9a-fA-F]{2})", reference):
+        raise InvalidOpenAPISpecError(f"Некорректный URI в JSON Pointer: {reference}")
+    try:
+        fragment = unquote(reference[1:], errors="strict")
+    except UnicodeDecodeError as error:
+        raise InvalidOpenAPISpecError(f"Некорректный UTF-8 в JSON Pointer: {reference}") from error
+    if fragment == "":
+        return ()
+    if not fragment.startswith("/"):
+        raise InvalidOpenAPISpecError(
+            f"Поддерживается только JSON Pointer во фрагменте: {reference}"
+        )
+    tokens = fragment[1:].split("/")
+    if any(re.search(r"~(?![01])", token) for token in tokens):
+        raise InvalidOpenAPISpecError(f"Некорректный JSON Pointer: {reference}")
+    return tuple(token.replace("~1", "/").replace("~0", "~") for token in tokens)
 
 
 def _mapping(value: object, label: str) -> dict[str, object]:
@@ -434,6 +488,24 @@ def _schema_type(node: dict[str, object]) -> tuple[str, bool]:
         if len(others) == 1 and others[0] in _TYPES:
             return others[0], True
     raise InvalidOpenAPISpecError(f"Неподдерживаемое значение type: {value!r}")
+
+
+def _parameter_serialization(
+    node: dict[str, object], location: ParamLocation
+) -> tuple[str, bool, bool]:
+    default_style = _PARAMETER_STYLES[location]
+    style = _text(node, "style")
+    if style is not None and style != default_style:
+        raise InvalidOpenAPISpecError(
+            f"Неподдерживаемый style для {location}: {style!r}; поддерживается {default_style}"
+        )
+    explode = _boolean(node, "explode", default=default_style == "form")
+    allow_reserved = _boolean(node, "allowReserved")
+    if allow_reserved and location != "query":
+        raise InvalidOpenAPISpecError("allowReserved поддерживается только для query")
+    if _boolean(node, "allowEmptyValue"):
+        raise InvalidOpenAPISpecError("allowEmptyValue=true пока не поддерживается")
+    return default_style, explode, allow_reserved
 
 
 def _parameter_key(parameter: ParameterSpec) -> tuple[str, ParamLocation]:
