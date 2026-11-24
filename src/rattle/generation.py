@@ -1,11 +1,18 @@
 """Построение данных запросов без HTTP-сериализации и сетевых вызовов."""
 
 import re
+from collections.abc import Iterator
 
+from rattle._mutations import request_mutations
 from rattle._schema_values import SchemaValues, ValueLimits
-from rattle.exceptions import NoExampleError, RequestGenerationError, UnsupportedSchemaError
+from rattle.exceptions import (
+    GenerationLimitError,
+    NoExampleError,
+    RequestGenerationError,
+    UnsupportedSchemaError,
+)
 from rattle.models import EndpointSpec, ParameterSpec, ParamLocation
-from rattle.requests import JSONValue, RequestData, RequestParameter
+from rattle.requests import JSONValue, MutationCase, RequestData, RequestParameter
 
 _STYLES: dict[ParamLocation, str] = {
     "path": "simple",
@@ -27,6 +34,40 @@ class RequestGenerator:
         """Строит подходящий пример для поддерживаемого подмножества схем."""
         try:
             return self._base(endpoint, SchemaValues(self._limits))
+        except RecursionError as error:
+            raise GenerationLimitError(
+                f"{endpoint.method} {endpoint.path}: Превышена глубина стека генерации"
+            ) from error
+        except RequestGenerationError as error:
+            raise type(error)(f"{endpoint.method} {endpoint.path}: {error}") from error
+
+    def generate(self, endpoint: EndpointSpec, *, limit: int = 100) -> Iterator[MutationCase]:
+        """Лениво выдаёт не более limit независимых запросов с одной локальной мутацией.
+
+        Лимит проверяется сразу; схема и базовый запрос — при первом next().
+        При limit=0 схема не обходится. Все варианты строятся из собственной базы,
+        а не из ранее выданного варианта; сетевых вызовов нет.
+        """
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+            raise ValueError("limit должен быть неотрицательным целым числом")
+        return self._generate(endpoint, limit)
+
+    def _generate(self, endpoint: EndpointSpec, limit: int) -> Iterator[MutationCase]:
+        if limit == 0:
+            return
+        values = SchemaValues(self._limits)
+        try:
+            base = self._base(endpoint, values)
+            count = 0
+            for case in request_mutations(endpoint, base, values):
+                yield case
+                count += 1
+                if count == limit:
+                    return
+        except RecursionError as error:
+            raise GenerationLimitError(
+                f"{endpoint.method} {endpoint.path}: Превышена глубина стека генерации"
+            ) from error
         except RequestGenerationError as error:
             raise type(error)(f"{endpoint.method} {endpoint.path}: {error}") from error
 

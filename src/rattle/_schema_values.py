@@ -130,8 +130,10 @@ class SchemaValues:
             if not isinstance(name, str) or not isinstance(child, SchemaSpec):
                 raise UnsupportedSchemaError("Некорректное описание properties")
             self.prepare(child, active, depth + 1)
-        if any(not isinstance(name, str) for name in schema.required_fields):
-            raise UnsupportedSchemaError("required должен содержать имена полей")
+        for name in schema.required_fields:
+            self.step()
+            if not isinstance(name, str):
+                raise UnsupportedSchemaError("required должен содержать имена полей")
         if schema.items is not None:
             self.prepare(schema.items, active, depth + 1)
         self._prepared[identity] = schema
@@ -154,10 +156,12 @@ class SchemaValues:
             return isinstance(value, dict)
         return kind == "array" and isinstance(value, list)
 
+    def in_enum(self, schema: SchemaSpec, value: JSONValue) -> bool:
+        return any(self.equal(value, choice) for choice in self._enums[id(schema)])
+
     def matches(self, schema: SchemaSpec, value: JSONValue, depth: int = 0) -> bool:
         self.step(depth)
-        choices = self._enums[id(schema)]
-        if choices and not any(self.equal(value, choice) for choice in choices):
+        if self._enums[id(schema)] and not self.in_enum(schema, value):
             return False
         if not self.allows_type(schema, value):
             return False
@@ -235,7 +239,8 @@ class SchemaValues:
             high = schema.max_length
             if high is not None and low > high:
                 raise NoExampleError("Противоречивые границы длины строки")
-            return self.text(max(1, low) if high != 0 else 0)
+            prefer_nonempty = high != 0 and self.limits.max_string_length != 0
+            return self.text(max(1, low) if prefer_nonempty else low)
         if kind == "array":
             if schema.items is None:
                 return []

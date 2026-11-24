@@ -1,4 +1,5 @@
 import json
+from typing import cast
 
 import pytest
 
@@ -256,9 +257,26 @@ def test_json_content_type_is_preserved(media_type: str) -> None:
 
 @pytest.mark.parametrize("name", ["max_depth", "max_nodes", "max_string_length"])
 @pytest.mark.parametrize("bad", [True, -1, 1.5])
-def test_generator_limits_are_validated(name: str, bad: int) -> None:
+def test_generator_limits_are_validated(name: str, bad: object) -> None:
     with pytest.raises(ValueError, match=name):
-        RequestGenerator(**{name: bad})
+        RequestGenerator(**{name: cast(int, bad)})
+
+
+@pytest.mark.parametrize("operation", ["base", "mutations"])
+def test_python_recursion_limit_is_reported_as_a_generation_limit(operation: str) -> None:
+    schema = SchemaSpec()
+    for _ in range(1500):
+        schema = SchemaSpec(schema_type="array", items=schema)
+    endpoint = EndpointSpec(
+        "POST", "/", request_body=RequestBodySpec(True, "application/json", schema)
+    )
+    generator = RequestGenerator(max_depth=2000)
+    with pytest.raises(GenerationLimitError, match="POST /.*глубина"):
+        if operation == "base":
+            generator.build_base(endpoint)
+        else:
+            next(generator.generate(endpoint))
+    assert generator.build_base(EndpointSpec("GET", "/")).has_body is False
 
 
 def test_node_budget_cannot_be_zero() -> None:
