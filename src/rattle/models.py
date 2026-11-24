@@ -13,7 +13,11 @@ HttpMethod = Literal["GET", "POST", "PUT", "PATCH", "DELETE"]
 
 @dataclass(frozen=True)
 class SchemaSpec:
-    """Описание типа данных и ограничений поля или тела запроса."""
+    """Описание типа данных и эффективных ограничений после нормализации.
+
+    В anyOf с отдельной ветвью null он добавляется в enum другой ветви;
+    для объединения типов общий enum не расширяется.
+    """
 
     schema_type: str = "any"
     nullable: bool = False
