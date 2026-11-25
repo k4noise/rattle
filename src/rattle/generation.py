@@ -12,7 +12,13 @@ from rattle.exceptions import (
     UnsupportedSchemaError,
 )
 from rattle.models import EndpointSpec, ParameterSpec, ParamLocation
-from rattle.requests import JSONValue, MutationCase, RequestData, RequestParameter
+from rattle.requests import (
+    GenerationWarning,
+    JSONValue,
+    MutationCase,
+    RequestData,
+    RequestParameter,
+)
 
 _STYLES: dict[ParamLocation, str] = {
     "path": "simple",
@@ -31,7 +37,7 @@ class RequestGenerator:
         self._limits = ValueLimits(max_depth, max_nodes, max_string_length)
 
     def build_base(self, endpoint: EndpointSpec) -> RequestData:
-        """Строит подходящий пример для поддерживаемого подмножества схем."""
+        """Строит пример; причины необязательных пропусков возвращает в request.warnings."""
         try:
             return self._base(endpoint, SchemaValues(self._limits))
         except RecursionError as error:
@@ -47,6 +53,7 @@ class RequestGenerator:
         Лимит проверяется сразу; схема и базовый запрос — при первом next().
         При limit=0 схема не обходится. Все варианты строятся из собственной базы,
         а не из ранее выданного варианта; сетевых вызовов нет.
+        Для диагностики базы, в том числе при пустом итераторе, есть build_base().
         """
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
             raise ValueError("limit должен быть неотрицательным целым числом")
@@ -81,6 +88,7 @@ class RequestGenerator:
             raise UnsupportedSchemaError("Параметры пути не соответствуют шаблону")
         seen: set[tuple[ParamLocation, str]] = set()
         parameters: list[RequestParameter] = []
+        warnings: list[GenerationWarning] = []
         for parameter in endpoint.parameters:
             values.step()
             key = _key(parameter.name, parameter.location)
@@ -90,10 +98,27 @@ class RequestGenerator:
             style, explode = _serialization(parameter)
             try:
                 value = values.build(parameter.schema)
-            except NoExampleError:
+            except NoExampleError as error:
                 if parameter.required or parameter.location == "path":
                     raise
+                warnings.append(
+                    GenerationWarning(
+                        "omitted_optional",
+                        parameter.location,
+                        (parameter.name,),
+                        f"Необязательный параметр пропущен: {error}",
+                    )
+                )
                 continue
+            warnings.extend(
+                GenerationWarning(
+                    warning.kind,
+                    parameter.location,
+                    (parameter.name, *warning.path),
+                    warning.message,
+                )
+                for warning in values.warnings
+            )
             parameters.append(
                 RequestParameter(
                     parameter.name,
@@ -116,14 +141,29 @@ class RequestGenerator:
                 raise UnsupportedSchemaError("Поддерживается только JSON-тело")
             try:
                 body = values.build(definition.schema)
-            except NoExampleError:
+            except NoExampleError as error:
                 if definition.required:
                     raise
+                warnings.append(
+                    GenerationWarning(
+                        "omitted_optional", "body", (), f"Необязательное тело пропущено: {error}"
+                    )
+                )
             else:
                 has_body = True
                 content_type = definition.content_type
+                warnings.extend(
+                    GenerationWarning(warning.kind, "body", warning.path, warning.message)
+                    for warning in values.warnings
+                )
         return RequestData(
-            endpoint.method, endpoint.path, tuple(parameters), body, has_body, content_type
+            endpoint.method,
+            endpoint.path,
+            tuple(parameters),
+            body,
+            has_body,
+            content_type,
+            warnings=tuple(warnings),
         )
 
 

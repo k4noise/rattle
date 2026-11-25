@@ -6,7 +6,7 @@ from typing import TypeGuard
 
 from rattle.exceptions import GenerationLimitError, NoExampleError, UnsupportedSchemaError
 from rattle.models import SchemaSpec
-from rattle.requests import JSONValue
+from rattle.requests import GenerationWarningKind, JSONPath, JSONValue
 
 _TYPES = frozenset({"any", "string", "integer", "number", "boolean", "null", "object", "array"})
 
@@ -32,6 +32,13 @@ class ValueLimits:
                 raise ValueError(f"Недопустимый лимит {name}")
 
 
+@dataclass(frozen=True)
+class _ValueWarning:
+    kind: GenerationWarningKind
+    path: JSONPath
+    message: str
+
+
 class SchemaValues:
     """Контекст одного вызова генератора: бюджеты и снимки enum не разделяются."""
 
@@ -40,6 +47,7 @@ class SchemaValues:
         self._visits = 0
         self._prepared: dict[int, SchemaSpec] = {}
         self._enums: dict[int, tuple[JSONValue, ...]] = {}
+        self.warnings: list[_ValueWarning] = []
 
     def step(self, depth: int = 0) -> None:
         if depth > self.limits.max_depth:
@@ -186,10 +194,12 @@ class SchemaValues:
         return True
 
     def build(self, schema: SchemaSpec) -> JSONValue:
+        """warnings описывают только результат этого построения, с относительными путями."""
+        self.warnings.clear()
         self.prepare(schema)
-        return self._build(schema, 0)
+        return self._build(schema, 0, ())
 
-    def _build(self, schema: SchemaSpec, depth: int) -> JSONValue:
+    def _build(self, schema: SchemaSpec, depth: int, path: JSONPath) -> JSONValue:
         self.step(depth)
         choices = self._enums[id(schema)]
         if choices:
@@ -206,15 +216,18 @@ class SchemaValues:
         elif schema.nullable and schema.schema_type != "null":
             kinds.append("null")
         for kind in kinds:
+            warning_count = len(self.warnings)
             try:
-                value = self._make(kind, schema, depth)
+                value = self._make(kind, schema, depth, path)
             except NoExampleError:
+                del self.warnings[warning_count:]
                 continue
             if self.matches(schema, value, depth):
                 return value
+            del self.warnings[warning_count:]
         raise NoExampleError("Не удалось построить значение для схемы")
 
-    def _make(self, kind: str, schema: SchemaSpec, depth: int) -> JSONValue:
+    def _make(self, kind: str, schema: SchemaSpec, depth: int, path: JSONPath) -> JSONValue:
         if kind == "null":
             return None
         if kind == "boolean":
@@ -245,17 +258,27 @@ class SchemaValues:
             if schema.items is None:
                 return []
             try:
-                return [self._build(schema.items, depth + 1)]
-            except NoExampleError:
+                return [self._build(schema.items, depth + 1, (*path, 0))]
+            except NoExampleError as error:
+                self.warnings.append(
+                    _ValueWarning(
+                        "empty_array", path, f"Выбран пустой массив: не построен элемент: {error}"
+                    )
+                )
                 return []
         result: dict[str, JSONValue] = {}
         for name, child in schema.properties.items():
             self.check_string(name)
             try:
-                result[name] = self._build(child, depth + 1)
-            except NoExampleError:
+                result[name] = self._build(child, depth + 1, (*path, name))
+            except NoExampleError as error:
                 if name in schema.required_fields:
                     raise
+                self.warnings.append(
+                    _ValueWarning(
+                        "omitted_optional", (*path, name), f"Необязательное поле пропущено: {error}"
+                    )
+                )
         for name in sorted(schema.required_fields - result.keys()):
             self.step(depth + 1)
             self.check_string(name)

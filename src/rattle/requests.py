@@ -17,6 +17,7 @@ MutationKind = Literal[
     "too_long",
 ]
 MutationLocation = Literal["path", "query", "header", "cookie", "body"]
+GenerationWarningKind = Literal["omitted_optional", "empty_array"]
 
 
 @dataclass(frozen=True)
@@ -30,6 +31,16 @@ class RequestParameter:
 
 
 @dataclass(frozen=True)
+class GenerationWarning:
+    """Причина пропуска при построении базы; путь имеет формат MutationCase.path."""
+
+    kind: GenerationWarningKind
+    location: MutationLocation
+    path: JSONPath
+    message: str
+
+
+@dataclass(frozen=True)
 class RequestData:
     """path остаётся шаблоном; has_body отличает отсутствие тела от JSON null."""
 
@@ -39,6 +50,7 @@ class RequestData:
     body: JSONValue = None
     has_body: bool = False
     content_type: str | None = None
+    warnings: tuple[GenerationWarning, ...] = ()
 
 
 @dataclass(frozen=True)
