@@ -357,7 +357,12 @@ class _DocumentParser:
             others = [branch for branch in variants if branch.get("type") != "null"]
             if len(nulls) == 1 and len(others) == 1 and nulls[0].keys() <= _ANNOTATIONS | {"type"}:
                 inner = self._schema(others[0], refs, depth + 1)
-                return replace(inner, nullable=True)
+                enum = inner.enum
+                # enum относится к этой ветви, а отдельная ветвь null всегда допустима.
+                # Для type: [T, "null"] общий enum, наоборот, остаётся пересечением.
+                if enum and all(value is not None for value in enum):
+                    enum = (*enum, self._enum_value(None))
+                return replace(inner, nullable=True, enum=enum)
         raise InvalidOpenAPISpecError(f"Неподдерживаемая конструкция {keyword}")
 
     def _resolve(
