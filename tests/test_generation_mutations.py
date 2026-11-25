@@ -231,6 +231,23 @@ def test_parameters_precede_body_and_keep_their_own_location() -> None:
         assert changed.parameters[index + 1 :] == base.parameters[index + 1 :]
 
 
+def test_missing_path_parameter_is_a_logical_mutation_not_a_concrete_url() -> None:
+    endpoint = EndpointSpec(
+        "GET",
+        "/items/{id}",
+        (ParameterSpec("id", "path", True, SchemaSpec(schema_type="integer")),),
+    )
+    generator = RequestGenerator()
+    base = generator.build_base(endpoint)
+    case = next(generator.generate(endpoint))
+    assert case.kind == "missing_required"
+    assert case.location == "path" and case.path == ("id",)
+    assert case.request.path == base.path == "/items/{id}"
+    assert case.request.parameters == ()
+    assert base.parameters[0].value == 0
+    assert case.request.warnings == ()
+
+
 def test_optional_parameter_cannot_be_omitted_but_its_required_child_can() -> None:
     endpoint = EndpointSpec(
         "GET",

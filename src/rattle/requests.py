@@ -42,7 +42,12 @@ class GenerationWarning:
 
 @dataclass(frozen=True)
 class RequestData:
-    """path остаётся шаблоном; has_body отличает отсутствие тела от JSON null."""
+    """Данные до HTTP: path — шаблон, has_body отличает отсутствие тела от JSON null.
+
+    Удаление path-параметра — логическая мутация, не инструкция удалить сегмент URL.
+    Политика отправки такого варианта пока не определена.
+    warnings описывают построение базы, а не намеренные мутации запроса.
+    """
 
     method: HttpMethod
     path: str
