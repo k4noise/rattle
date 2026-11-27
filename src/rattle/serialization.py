@@ -13,7 +13,8 @@ from rattle.http_models import SerializedRequest
 from rattle.requests import JSONValue, RequestData, RequestParameter
 
 _STYLES = {"path": "simple", "query": "form", "header": "simple", "cookie": "form"}
-_RESERVED = ":/?[]@!$&'()*+,;="  # # нельзя поместить в URL как часть query без экранирования.
+_RESERVED = ":/?[]@!$&'()*+,;="
+_AMBIGUOUS_QUERY = "#&+;"  # fragment, новая пара, form-пробел, альтернативный разделитель.
 _TOKEN = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+\Z")
 _PLACEHOLDER = re.compile(r"\{([^{}]+)\}")
 _CONTROLLED_HEADERS = frozenset(
@@ -37,7 +38,9 @@ def http_url(value: str, *, allow_query: bool = False) -> httpx.URL:
         if not value or value != value.strip() or any(ord(char) < 32 for char in value):
             raise ValueError("URL содержит пробелы по краям или управляющие символы")
         parts = urlsplit(value)
-        if "\\" in value or re.search(r"%(?![0-9a-fA-F]{2})", parts.path + parts.query):
+        if "\\" in value or any(
+            re.search(r"%(?![0-9a-fA-F]{2})", part) for part in (parts.path, parts.query)
+        ):
             raise ValueError("URL содержит обратный слеш или некорректный percent-escape")
         if any(part in {".", ".."} for part in parts.path.split("/")):
             raise ValueError("Dot-сегменты URL привели бы к неявной смене пути")
@@ -130,15 +133,20 @@ def _simple(parameter: RequestParameter, encode: Callable[[str], str]) -> str:
 
 def _form(parameter: RequestParameter) -> list[tuple[str, str]]:
     name = quote(parameter.name, safe="")
-
-    def encode(value: str) -> str:
-        if parameter.allow_reserved and "#" in value:
-            raise UnsendableRequestError(
-                "allowReserved с # не представим без изменения query/fragment"
-            )
-        return quote(value, safe=_RESERVED if parameter.allow_reserved else "")
-
     value = parameter.value
+    ambiguous = _AMBIGUOUS_QUERY
+    if not parameter.explode and isinstance(value, (list, dict)):
+        ambiguous += ","  # Запятая данных не должна становиться разделителем CSV.
+
+    def encode(text: str) -> str:
+        if parameter.allow_reserved:
+            for separator in ambiguous:
+                if separator in text:
+                    raise UnsendableRequestError(
+                        f"allowReserved оставляет неоднозначный разделитель {separator!r} в query"
+                    )
+        return quote(text, safe=_RESERVED if parameter.allow_reserved else "")
+
     if parameter.explode and isinstance(value, (list, dict)):
         if not value:
             raise UnsendableRequestError(

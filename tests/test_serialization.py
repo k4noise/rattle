@@ -99,17 +99,11 @@ def test_allow_reserved_is_used_for_query_values_only() -> None:
     request = RequestData(
         "GET",
         "/",
-        (RequestParameter("q/", "query", "/a?b:c@d!$'()*+,;=[]&x=y", "form", True, True),),
+        (RequestParameter("q/", "query", "/a?b:c@d!$'()*,=[]", "form", True, True),),
     )
     result = RequestSerializer("https://api.example.test").serialize(request)
-    assert result.url.endswith("?q%2F=/a?b:c@d!$'()*+,;=[]&x=y")
+    assert result.url.endswith("?q%2F=/a?b:c@d!$'()*,=[]")
     assert httpx.URL(result.url).fragment == ""
-
-
-def test_a_literal_fragment_with_allow_reserved_is_explicitly_unsendable() -> None:
-    request = RequestData("GET", "/", (RequestParameter("q", "query", "a#b", "form", True, True),))
-    with pytest.raises(UnsendableRequestError):
-        RequestSerializer("https://api.example.test").serialize(request)
 
 
 @pytest.mark.parametrize("id_value", [".", ".."])

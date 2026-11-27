@@ -453,6 +453,7 @@ name = "rattle"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "httpcore" },
     { name = "httpx" },
     { name = "pyyaml" },
 ]
@@ -467,6 +468,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "httpcore", specifier = ">=1.0.9,<2" },
     { name = "httpx", specifier = ">=0.28,<1" },
     { name = "pyyaml", specifier = ">=6.0" },
 ]

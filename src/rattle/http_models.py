@@ -8,7 +8,14 @@ from rattle.requests import MutationCase
 
 SendOutcome = Literal["response", "crash", "unsendable", "serialization_error", "network_error"]
 ErrorKind = Literal[
-    "serialization", "unsendable", "timeout", "connection", "response", "network", "probe_limit"
+    "serialization",
+    "unsendable",
+    "timeout",
+    "connection",
+    "response",
+    "protocol",
+    "network",
+    "probe_limit",
 ]
 Headers = tuple[tuple[str, str], ...]
 
@@ -25,13 +32,18 @@ class SerializedRequest:
 
 @dataclass(frozen=True)
 class HTTPResponseData:
-    """Тело содержит сырые байты без распаковки Content-Encoding."""
+    """Сырые байты без распаковки Content-Encoding.
+
+    peer_eof — транспорт наблюдал EOF на соединении именно этого ответа.
+    Сам по себе EOF не ошибка: у close-delimited тела это нормальное завершение.
+    """
 
     status_code: int
     headers: Headers = ()
     content: bytes = b""
     complete: bool = True
     truncated: bool = False
+    peer_eof: bool = False
 
 
 @dataclass(frozen=True)
